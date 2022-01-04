@@ -1,0 +1,658 @@
+import math
+import numpy as np
+import os
+import contextlib
+import copy
+from PIL import Image
+import pickle
+import pathlib
+from pathlib import Path
+
+import requests
+import matplotlib.pyplot as plt
+#%config InlineBackend.figure_format = 'retina'
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import torch
+#print("torch.__version__", torch.__version__)
+from torch import nn
+from torchvision.models import resnet50
+import torchvision.transforms as T
+torch.set_grad_enabled(False);
+import os
+import torch
+import torch.utils.data
+from torch.utils.data import DataLoader
+import torchvision
+from PIL import Image, ImageDraw
+from pycocotools.coco import COCO
+from pycocotools import mask as coco_mask
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from torch.utils.data import Dataset
+import tqdm
+from tqdm import tqdm
+import skimage.io as io
+import pylab
+import torchvision
+import json
+from collections import OrderedDict
+from transformers import DetrFeatureExtractor, DetrConfig, DetrForObjectDetection
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+import utils
+import pycocotools.mask as mask_util
+import torch.distributed as dist
+import random
+
+class CocoDetection(torchvision.datasets.CocoDetection):
+    def __init__(self, img_folder, feature_extractor, train=True):
+        ann_file = os.path.join(img_folder, "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/train/train.json" if train else "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/val/val.json")
+        img_folder = os.path.join(img_folder, "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/train/Images_train" if train else "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/val/Images_val")
+        super(CocoDetection, self).__init__(img_folder, ann_file)
+        self.feature_extractor = feature_extractor
+
+    def __getitem__(self, idx):
+        # read in PIL image and target in COCO format
+        img, target = super(CocoDetection, self).__getitem__(idx)
+        
+        # preprocess image and target (converting target to DETR format, resizing + normalization of both image and target)
+        image_id = self.ids[idx]
+        target = {'image_id': image_id, 'annotations': target}
+        encoding = self.feature_extractor(images=img, annotations=target, return_tensors="pt")
+        
+        pixel_values = encoding["pixel_values"].squeeze() # remove batch dimension
+        target = encoding["labels"][0] # remove batch dimension
+
+        return pixel_values, target
+
+feature_extractor = DetrFeatureExtractor.from_pretrained("facebook/detr-resnet-50")
+
+
+train_dataset = CocoDetection(img_folder= "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/train/Images_train", feature_extractor=feature_extractor)
+val_dataset = CocoDetection(img_folder= "/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/val/Images_val", feature_extractor=feature_extractor, train=False)
+
+
+print("Number of training examples:", len(train_dataset)) 
+print("Number of validation examples:", len(val_dataset))
+
+
+
+image_ids = train_dataset.coco.getImgIds()
+# let's pick a random image
+image_id = image_ids[np.random.randint(0, len(image_ids))]
+print('Image n°{}'.format(image_id))
+image = train_dataset.coco.loadImgs(image_id)[0] 
+image = Image.open(os.path.join("/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/train/Images_train", image['file_name']))
+
+
+annotations = train_dataset.coco.imgToAnns[image_id]
+draw = ImageDraw.Draw(image, "RGBA")
+
+cats = train_dataset.coco.cats
+id2label = {k: v['name'] for k,v in cats.items()}
+
+for annotation in annotations:
+  box = annotation['bbox']
+  class_idx = annotation['category_id']
+  x,y,w,h = tuple(box)
+  draw.rectangle((x,y,x+w,y+h), outline='red', width=1)
+  draw.text((x, y), id2label[class_idx], fill='white')
+
+image
+
+image.save('/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/outputs/sample_image.jpg', 'JPEG')
+
+
+def collate_fn(batch):
+  pixel_values = [item[0] for item in batch]
+  encoding = feature_extractor.pad_and_create_pixel_mask(pixel_values, return_tensors="pt")
+  labels = [item[1] for item in batch]
+  batch = {}
+  batch['pixel_values'] = encoding['pixel_values']
+  batch['pixel_mask'] = encoding['pixel_mask']
+  batch['labels'] = labels
+  return batch
+
+train_dataloader = DataLoader(train_dataset, collate_fn=collate_fn, batch_size=4, shuffle=True)
+val_dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=2)
+
+batch = next(iter(train_dataloader))
+
+print(batch.keys())
+
+pixel_values, target = train_dataset[0]
+print("\npixel_values.shape", pixel_values.shape)
+
+class Detr(pl.LightningModule):
+
+     def __init__(self, lr, lr_backbone, weight_decay):
+         super().__init__()
+         # replace COCO classification head with custom head
+         self.model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50", 
+                                                             num_labels=len(id2label),
+                                                             ignore_mismatched_sizes=True)
+         
+         self.lr = lr
+         self.lr_backbone = lr_backbone
+         self.weight_decay = weight_decay
+
+     def forward(self, pixel_values, pixel_mask):
+       outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+
+       return outputs
+     
+     def common_step(self, batch, batch_idx):
+       pixel_values = batch["pixel_values"]
+       pixel_mask = batch["pixel_mask"]
+       labels = [{k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]]
+
+       outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+
+       loss = outputs.loss
+       loss_dict = outputs.loss_dict
+
+       return loss, loss_dict
+
+     def training_step(self, batch, batch_idx):
+        loss, loss_dict = self.common_step(batch, batch_idx)     
+        self.log("training_loss", loss, on_step=True, on_epoch=True)
+        for k,v in loss_dict.items():
+          self.log("train_" + k, v.item())
+
+        return loss
+
+     def validation_step(self, batch, batch_idx):
+        loss, loss_dict = self.common_step(batch, batch_idx)     
+        self.log("validation_loss", loss, on_step=True, on_epoch=True)
+        for k,v in loss_dict.items():
+          self.log("validation_" + k, v.item())
+
+        return loss
+
+     def configure_optimizers(self):
+        param_dicts = [
+              {"params": [p for n, p in self.named_parameters() if "backbone" not in n and p.requires_grad]},
+              {
+                  "params": [p for n, p in self.named_parameters() if "backbone" in n and p.requires_grad],
+                  "lr": self.lr_backbone,
+              },
+        ]
+        optimizer = torch.optim.Adam(param_dicts, lr=self.lr,
+                                  weight_decay=self.weight_decay)
+        
+        return optimizer
+
+     def train_dataloader(self):
+        return train_dataloader
+
+     def val_dataloader(self):
+        return val_dataloader
+
+
+
+model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-6)
+
+outputs = model(pixel_values=batch['pixel_values'], pixel_mask=batch['pixel_mask'])
+
+print("\noutputs.logits.shape", outputs.logits.shape)
+
+
+
+trainer = Trainer(gpus=1 , max_steps=500, gradient_clip_val=0.1)
+trainer.fit(model)
+
+
+def convert_to_coco_api(ds):
+    coco_ds = COCO()
+    ann_id = 1
+    dataset = {"images": [], "categories": [], "annotations": []}
+    categories = set()
+    for img_idx in range(len(ds)):
+    
+        img, targets = ds[img_idx]
+        image_id = targets["image_id"].item()
+        img_dict = {}
+        img_dict["id"] = image_id
+        img_dict["height"] = img.shape[-2]
+        img_dict["width"] = img.shape[-1]
+        dataset["images"].append(img_dict)
+        bboxes = targets["boxes"]
+        bboxes[:, 2:] -= bboxes[:, :2]
+        bboxes = bboxes.tolist()
+        labels = targets["labels"].tolist()
+        areas = targets["area"].tolist()
+        iscrowd = targets["iscrowd"].tolist()
+        if "masks" in targets:
+            masks = targets["masks"]
+            
+            masks = masks.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+        if "keypoints" in targets:
+            keypoints = targets["keypoints"]
+            keypoints = keypoints.reshape(keypoints.shape[0], -1).tolist()
+        num_objs = len(bboxes)
+        for i in range(num_objs):
+            ann = {}
+            ann["image_id"] = image_id
+            ann["bbox"] = bboxes[i]
+            ann["category_id"] = labels[i]
+            categories.add(labels[i])
+            ann["area"] = areas[i]
+            ann["iscrowd"] = iscrowd[i]
+            ann["id"] = ann_id
+            if "masks" in targets:
+                ann["segmentation"] = coco_mask.encode(masks[i].numpy())
+            if "keypoints" in targets:
+                ann["keypoints"] = keypoints[i]
+                ann["num_keypoints"] = sum(k != 0 for k in keypoints[i][2::3])
+            dataset["annotations"].append(ann)
+            ann_id += 1
+    dataset["categories"] = [{"id": i} for i in sorted(categories)]
+    coco_ds.dataset = dataset
+    coco_ds.createIndex()
+    return coco_ds
+
+def get_coco_api_from_dataset(dataset):
+    for _ in range(10):
+        if isinstance(dataset, torchvision.datasets.CocoDetection):
+            break
+        if isinstance(dataset, torch.utils.data.Subset):
+            dataset = dataset.dataset
+    if isinstance(dataset, torchvision.datasets.CocoDetection):
+        return dataset.coco
+    return convert_to_coco_api(dataset)
+
+
+base_ds = get_coco_api_from_dataset(val_dataset) # this is actually just calling the coco attribute
+
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+
+
+def all_gather(data):
+    """
+    Run all_gather on arbitrary picklable data (not necessarily tensors)
+    Args:
+        data: any picklable object
+    Returns:
+        list[data]: list of data gathered from each rank
+    """
+    world_size = get_world_size()
+    if world_size == 1:
+        return [data]
+
+    # serialized to a Tensor
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to("cuda")
+
+    # obtain Tensor size of each rank
+    local_size = torch.tensor([tensor.numel()], device="cuda")
+    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    size_list = [int(size.item()) for size in size_list]
+    max_size = max(size_list)
+
+    # receiving Tensor from all ranks
+    # we pad the tensor because torch all_gather does not support
+    # gathering tensors of different shapes
+    tensor_list = []
+    for _ in size_list:
+        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
+    if local_size != max_size:
+        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+        tensor = torch.cat((tensor, padding), dim=0)
+    dist.all_gather(tensor_list, tensor)
+
+    data_list = []
+    for size, tensor in zip(size_list, tensor_list):
+        buffer = tensor.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buffer))
+
+    return data_list
+
+
+
+
+class CocoEvaluator(object):
+    def __init__(self, coco_gt, iou_types):
+        assert isinstance(iou_types, (list, tuple))
+        coco_gt = copy.deepcopy(coco_gt)
+        self.coco_gt = coco_gt
+
+        self.iou_types = iou_types
+        self.coco_eval = {}
+        for iou_type in iou_types:
+            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
+
+        self.img_ids = []
+        self.eval_imgs = {k: [] for k in iou_types}
+
+    def update(self, predictions):
+        img_ids = list(np.unique(list(predictions.keys())))
+        self.img_ids.extend(img_ids)
+
+        for iou_type in self.iou_types:
+            results = self.prepare(predictions, iou_type)
+
+            # suppress pycocotools prints
+            with open(os.devnull, 'w') as devnull:
+                with contextlib.redirect_stdout(devnull):
+                    coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
+            coco_eval = self.coco_eval[iou_type]
+
+            coco_eval.cocoDt = coco_dt
+            coco_eval.params.imgIds = list(img_ids)
+            img_ids, eval_imgs = evaluate(coco_eval)
+
+            self.eval_imgs[iou_type].append(eval_imgs)
+
+    def synchronize_between_processes(self):
+        for iou_type in self.iou_types:
+            self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
+            create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+
+    def accumulate(self):
+        for coco_eval in self.coco_eval.values():
+            coco_eval.accumulate()
+
+    def summarize(self):
+        for iou_type, coco_eval in self.coco_eval.items():
+            print("IoU metric: {}".format(iou_type))
+            coco_eval.summarize()
+
+    def prepare(self, predictions, iou_type):
+        if iou_type == "bbox":
+            return self.prepare_for_coco_detection(predictions)
+        elif iou_type == "segm":
+            return self.prepare_for_coco_segmentation(predictions)
+        elif iou_type == "keypoints":
+            return self.prepare_for_coco_keypoint(predictions)
+        else:
+            raise ValueError("Unknown iou type {}".format(iou_type))
+
+    def prepare_for_coco_detection(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            boxes = prediction["boxes"]
+            boxes = convert_to_xywh(boxes).tolist()
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        "bbox": box,
+                        "score": scores[k],
+                    }
+                    for k, box in enumerate(boxes)
+                ]
+            )
+        return coco_results
+
+    def prepare_for_coco_segmentation(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            scores = prediction["scores"]
+            labels = prediction["labels"]
+            masks = prediction["masks"]
+
+            masks = masks > 0.5
+
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+
+            rles = [
+                mask_util.encode(np.array(mask[0, :, :, np.newaxis], dtype=np.uint8, order="F"))[0]
+                for mask in masks
+            ]
+            for rle in rles:
+                rle["counts"] = rle["counts"].decode("utf-8")
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        "segmentation": rle,
+                        "score": scores[k],
+                    }
+                    for k, rle in enumerate(rles)
+                ]
+            )
+        return coco_results
+
+    def prepare_for_coco_keypoint(self, predictions):
+        coco_results = []
+        for original_id, prediction in predictions.items():
+            if len(prediction) == 0:
+                continue
+
+            boxes = prediction["boxes"]
+            boxes = convert_to_xywh(boxes).tolist()
+            scores = prediction["scores"].tolist()
+            labels = prediction["labels"].tolist()
+            keypoints = prediction["keypoints"]
+            keypoints = keypoints.flatten(start_dim=1).tolist()
+
+            coco_results.extend(
+                [
+                    {
+                        "image_id": original_id,
+                        "category_id": labels[k],
+                        'keypoints': keypoint,
+                        "score": scores[k],
+                    }
+                    for k, keypoint in enumerate(keypoints)
+                ]
+            )
+        return coco_results
+
+
+def convert_to_xywh(boxes):
+    xmin, ymin, xmax, ymax = boxes.unbind(1)
+    return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
+
+
+def merge(img_ids, eval_imgs):
+    all_img_ids = all_gather(img_ids)
+    all_eval_imgs = all_gather(eval_imgs)
+
+    merged_img_ids = []
+    for p in all_img_ids:
+        merged_img_ids.extend(p)
+
+    merged_eval_imgs = []
+    for p in all_eval_imgs:
+        merged_eval_imgs.append(p)
+
+    merged_img_ids = np.array(merged_img_ids)
+    merged_eval_imgs = np.concatenate(merged_eval_imgs, 2)
+
+    
+    merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
+    merged_eval_imgs = merged_eval_imgs[..., idx]
+
+    return merged_img_ids, merged_eval_imgs
+
+
+def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
+    img_ids, eval_imgs = merge(img_ids, eval_imgs)
+    img_ids = list(img_ids)
+    eval_imgs = list(eval_imgs.flatten())
+
+    coco_eval.evalImgs = eval_imgs
+    coco_eval.params.imgIds = img_ids
+    coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
+
+
+
+
+def evaluate(self):
+    '''
+    Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
+    :return: None
+    '''
+    
+    p = self.params
+    # add backward compatibility if useSegm is specified in params
+    if p.useSegm is not None:
+        p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
+        print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
+    
+    p.imgIds = list(np.unique(p.imgIds))
+    if p.useCats:
+        p.catIds = list(np.unique(p.catIds))
+    p.maxDets = sorted(p.maxDets)
+    self.params = p
+
+    self._prepare()
+    # loop through images, area range, max detection number
+    catIds = p.catIds if p.useCats else [-1]
+
+    if p.iouType == 'segm' or p.iouType == 'bbox':
+        computeIoU = self.computeIoU
+    elif p.iouType == 'keypoints':
+        computeIoU = self.computeOks
+    self.ious = {
+        (imgId, catId): computeIoU(imgId, catId)
+        for imgId in p.imgIds
+        for catId in catIds}
+
+    evaluateImg = self.evaluateImg
+    maxDet = p.maxDets[-1]
+    evalImgs = [
+        evaluateImg(imgId, catId, areaRng, maxDet)
+        for catId in catIds
+        for areaRng in p.areaRng
+        for imgId in p.imgIds
+    ]
+    
+    evalImgs = np.asarray(evalImgs).reshape(len(catIds), len(p.areaRng), len(p.imgIds))
+    self._paramsEval = copy.deepcopy(self.params)
+    
+    return p.imgIds, evalImgs
+
+
+
+
+
+iou_types = ['bbox']
+
+coco_evaluator = CocoEvaluator(base_ds, iou_types) # initialize evaluator with ground truths
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model.to(device)
+model.eval()
+
+print("Running evaluation...")
+
+for idx, batch in enumerate(tqdm(val_dataloader)):
+    # get the inputs
+    pixel_values = batch["pixel_values"].to(device)
+    pixel_mask = batch["pixel_mask"].to(device)
+    labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]] # these are in DETR format, resized + normalized
+
+    # forward pass
+    outputs = model.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+
+    orig_target_sizes = torch.stack([target["orig_size"] for target in labels], dim=0)
+    results = feature_extractor.post_process(outputs, orig_target_sizes) # convert outputs of model to COCO api
+    res = {target['image_id'].item(): output for target, output in zip(labels, results)}
+    coco_evaluator.update(res)
+
+coco_evaluator.synchronize_between_processes()
+coco_evaluator.accumulate()
+coco_evaluator.summarize()
+
+
+pixel_values, target = val_dataset[1]
+
+pixel_values = pixel_values.unsqueeze(0).to(device)
+print(pixel_values.shape)
+
+
+outputs = model(pixel_values=pixel_values, pixel_mask=None)
+
+# colors for visualization
+COLORS = [[0.000, 0.447, 0.741], [0.850, 0.325, 0.098], [0.929, 0.694, 0.125],
+          [0.494, 0.184, 0.556], [0.466, 0.674, 0.188], [0.301, 0.745, 0.933]]
+
+# for output bounding box post-processing
+def box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=1)
+
+def rescale_bboxes(out_bbox, size):
+    img_w, img_h = size
+    b = box_cxcywh_to_xyxy(out_bbox)
+    b = b * torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32)
+    return b
+
+def plot_results(pil_img, prob, boxes):
+    plt.figure(figsize=(16,10))
+    plt.imshow(pil_img)
+    ax = plt.gca()
+    colors = COLORS * 100
+    for p, (xmin, ymin, xmax, ymax), c in zip(prob, boxes.tolist(), colors):
+        ax.add_patch(plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
+                                   fill=False, color=c, linewidth=3))
+        cl = p.argmax()
+        text = f'{id2label[cl.item()]}: {p[cl]:0.2f}'
+        ax.text(xmin, ymin, text, fontsize=15,
+                bbox=dict(facecolor='yellow', alpha=0.5))
+    plt.axis('off')
+    plt.savefig('/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/outputs/final_validation.jpg')
+    plt.show()
+
+
+def visualize_predictions(image, outputs, threshold=0.5):
+  # keep only predictions with confidence >= threshold
+  probas = outputs.logits.softmax(-1)[0, :, :-1]
+  keep = probas.max(-1).values > threshold
+  
+  # convert predicted boxes from [0; 1] to image scales
+  bboxes_scaled = rescale_bboxes(outputs.pred_boxes[0, keep].cpu(), image.size)
+
+  # plot results
+  plot_results(image, probas[keep], bboxes_scaled)
+  
+
+
+image_id = target['image_id'].item()
+image = val_dataset.coco.loadImgs(image_id)[0]
+image = Image.open(os.path.join('/zhome/c2/d/153962/deep_project/deep_data/Deep_ learning data/val/Images_val', image['file_name']))
+
+
+
+visualize_predictions(image, outputs)
+
+
+
+# Code https://github.com/NielsRogge/Transformers-Tutorials/tree/master/DETR
+# Code https://github.com/facebookresearch/detr
